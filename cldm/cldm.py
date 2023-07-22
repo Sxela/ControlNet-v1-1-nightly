@@ -315,6 +315,8 @@ class ControlLDM(LatentDiffusion):
         self.control_scales = [1.0] * 13
         self.global_average_pooling = global_average_pooling
         self.low_vram = False
+        self.normalize_weights = True 
+        self.debug = False 
 
 
     @torch.no_grad()
@@ -342,6 +344,11 @@ class ControlLDM(LatentDiffusion):
             return eps
 
         if isinstance(cond['c_concat'], dict):
+          try:
+            uc_mask_shape = diffusion_model.uc_mask_shape
+            # uc_mask_shape = torch.where(uc_mask_shape==0, -1, 1)
+          except: 
+            uc_mask_shape = torch.ones(x_noisy.shape[0], device=x_noisy.device)        
           controlnet_multimodel = cond['controlnet_multimodel']
           loaded_controlnets = cond['loaded_controlnets']
           control_wsum = None
@@ -352,13 +359,24 @@ class ControlLDM(LatentDiffusion):
             if settings['weight']!=0 and t_ratio>=settings['start'] and t_ratio<=settings['end']:
               active_models[key] = controlnet_multimodel[key]
           weights = np.array([active_models[m]["weight"] for m in active_models.keys()])
-          weights = weights/weights.sum()
+          if self.normalize_weights: weights = weights/weights.sum()
           for i,key in enumerate(active_models.keys()):
-            try:            
+            if self.debug: 
+                print('controlnet_multimodel keys ', controlnet_multimodel[key].keys())  
+                print('Using layer weights ', controlnet_multimodel[key]['layer_weights'], key)
+            try:   
                 cond_hint = torch.cat([cond['c_concat'][key]], 1)
+                if 'zero_uncond' in controlnet_multimodel[key].keys():
+                    if controlnet_multimodel[key]['zero_uncond']:
+                        if self.debug: print(f'Using zero uncond {list(uc_mask_shape.detach().cpu().numpy())} for {key}')
+                        cond_hint*=uc_mask_shape # try zeroing the prediction, shuold mimic zero uncond, need to research more                  
                 if self.low_vram:
                   loaded_controlnets[key].to(device=cond_hint.device)
                 control = loaded_controlnets[key](x=x_noisy, hint=cond_hint, timesteps=t, context=cond_txt)
+                if 'layer_weights' in controlnet_multimodel[key].keys():
+                    control_scales = controlnet_multimodel[key]['layer_weights']
+                    if self.debug: print('Using layer weights ', control_scales, key)
+                    control = [c * scale for c, scale in zip(control, control_scales)]
                 if key == 'control_sd15_shuffle':
                     #apply avg pooling for shuffle control
                     control = [torch.mean(c, dim=(2, 3), keepdim=True) for c in control]
